@@ -1,43 +1,52 @@
 # Predicting Housing Affordability in the U.S. (Kaggle)
 
-Predict `AffordabilityPercentageTrue` (share of households spending ≤30% of income on
-housing) per ZIP code for July 2026. Training data covers May and June.
+Predict `AffordabilityPercentageTrue`, the share of households spending ≤30% of income on
+housing, for each ZIP in July 2026. Training data covers May and June.
 
-- `housing_affordability.ipynb`: Kaggle notebook. Upload it and attach the competition data.
-- `housing_affordability.py`: the same code as a script (`DATA_DIR=... python housing_affordability.py`).
+- `housing_affordability.ipynb`: Kaggle notebook. Attach the competition data and run all cells.
+- `housing_affordability.py`: the same code as a script (`DATA_DIR=<folder> python housing_affordability.py`).
 
-## How the score works
+The competition data is **not** in this repo: the rules forbid redistributing it.
 
-- **Seen ZIPs** are July rows for ZIPs that appear in train. The model can use each ZIP's own history.
-- **New ZIPs** are July rows for ZIPs held out of train entirely. They get **more weight** in
-  the final score.
-- The public leaderboard uses only 30% of test, so trust local CV over leaderboard moves.
+## What we found in the data
 
-## Strategy
+| Fact | Why it matters |
+|---|---|
+| All 6,830 training ZIPs appear in both May and June. In test, 6,830 ZIPs are seen and 1,704 are new. | Two separate problems. |
+| The May→June target correlation is 0.999, and "June = May" has RMSE 1.25. | Seen ZIPs are nearly solved by copying the last value. |
+| The target drifts down about 0.33 per month, and the amount differs by state (NY −0.63, FL +0.25). | Add a state drift. Tested May→June: RMSE falls from 1.25 to 1.17. |
+| The target is strongly geographic: CA ≈ 9%, WA ≈ 20%, TX ≈ 62%, OH ≈ 69%. | Nearby ZIPs' known values are the best predictors for new ZIPs. |
+| Target changes are **not** related to rent changes (corr ≈ 0). | The target isn't a simple rent formula, so feature-only models plateau. |
+| Income never changes between months. | It's a fixed ZIP attribute. |
+| July features jumped for the same ZIPs: senior% +0.37 std, adults +0.29 std, young adults +0.32 std. | We also train on July features so the model matches the new ZIPs' July rows. |
+| `RentIndex` is missing for 8.7% of train rows but only 9 test rows. | Fill it from the same ZIP's July value. |
 
-1. **Validate like the test.**
-   - New ZIPs: `GroupKFold` by ZIP. A random row split leaks the same ZIP's other month
-     into validation.
-   - Seen ZIPs: predict one month from the other.
-   - Combine the two RMSEs with the competition weighting.
-2. **Physics-style features.** The target is roughly the CDF of income vs annual rent:
-   `Φ(log(0.3·income / (12·rent)) / σ)`. Add rent-to-income ratios, owner/renter
-   interactions, and income per person or adult.
-3. **Missing RentIndex.** Impute from the same ZIP's other month, then from
-   City → zip3 → Metro → State medians. Add a missing flag.
-4. **Geographic target encoding.** Encode zip3, zip2, Metro, City and State strictly
-   out-of-fold. This is the main lever for New ZIPs.
-5. **Two models.**
-   - Model A uses features only and handles New ZIPs.
-   - Model B handles Seen ZIPs. It starts from the last known target and learns a
-     correction from month-over-month feature deltas and Model A.
-6. **Ensemble.** Blend LightGBM and CatBoost, try several seeds, and clip predictions to [0, 100].
+## Approach
 
-## Ideas to try next
+1. **Seen ZIPs:** June value plus the state's average monthly drift.
+2. **New ZIPs:** LightGBM and CatBoost trained on:
+   - rent vs income: `log(income / (40 × rent))`
+   - household-mix ratios
+   - each ZIP compared with its area's average
+   - neighbour labels: smoothed averages over state, metro, zip3 and city, plus the closest
+     1, 3 and 8 ZIP numbers. These are always built without the ZIP's own label.
+3. **Validation:** 5-fold over ZIPs. Hidden ZIPs are scored on their July-feature rows,
+   which mimics a genuinely new ZIP.
 
-- Logit-transform the target, and weight samples by `SampleSize`. Compare both on CV.
-- Nearest-neighbour target features using nearby ZIP numbers within the same zip3.
-- Tune σ in the Φ feature, or fit it per state.
-- Optuna tuning. Add XGBoost or a ridge model on the engineered features to the blend.
-- Pseudo-relationships from the test *features* are fine to use; test *labels* do not exist.
-  External data is **not allowed**.
+## Experiment log (new-ZIP CV RMSE; lower is better)
+
+| Experiment | RMSE |
+|---|---|
+| Features only, no geography | 13.61 |
+| + raw State / Metro / City / zip3 categories | 12.32 |
+| + engineered + "relative to area" features + neighbour labels, no raw high-cardinality categories | 11.99 |
+| + `colsample_bytree=0.3` | 11.95 |
+| Extra ideas: neighbour feature differences, residual kriging | no gain |
+| LightGBM + CatBoost blend | see notebook output |
+
+## Ideas not tried yet
+
+- More seeds and folds, and Optuna tuning of LightGBM and CatBoost.
+- A level-aware drift for seen ZIPs (state × target level). It gave a small May→June gain: 1.166 vs 1.169.
+- Use the public leaderboard sparingly, e.g. one submission with and one without the seen-ZIP drift.
+  Only 30% of test is public, so don't chase it.

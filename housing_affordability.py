@@ -1,16 +1,29 @@
 # %% [markdown]
-# # Predicting Housing Affordability in the U.S. (starter pipeline)
+# # Predicting Housing Affordability in the U.S.
 #
-# Two scores matter: **Seen ZIPs** (in May/June train, predict July) and **New ZIPs**
-# (never seen). New ZIPs carry more weight, so we build two models:
+# **Goal:** for every ZIP in July, predict `AffordabilityPercentageTrue`: the share of
+# households that are *not* cost-burdened.
 #
-# * **Model A (geo)** – uses features only, no ZIP history. Validated with
-#   `GroupKFold` on ZIP so both months of a ZIP land in the same fold. Used for New ZIPs.
-# * **Model B (seen)** – Model A's features + the ZIP's last known target and the
-#   month-over-month change in its features. Validated by predicting one month
-#   from the other. Used for Seen ZIPs.
+# ### What the data analysis showed (and what the plan is)
+# 1. **Every training ZIP is in both May and June.** In test, 6,830 ZIPs are *seen* (80%)
+#    and 1,704 are *new* (20%).
+# 2. **Seen ZIPs are easy.** The target barely moves month to month. Predicting
+#    "June = May" already gives RMSE ≈ 1.25, and the value tends to drift *down* a little
+#    (about −0.33 per month, different by state). So for seen ZIPs we predict
+#    **June value + state drift**.
+# 3. **New ZIPs are hard, and they decide the ranking.** A model that only has features
+#    gets RMSE ≈ 12. Geography matters most (CA ≈ 9%, TX ≈ 62%), so the strongest
+#    signals are the known values of nearby ZIPs (same zip3, metro, city, and the
+#    closest ZIP numbers).
+# 4. **July features shifted.** Adults, senior %, young-adult % and household size jumped
+#    by 0.2–0.4 standard deviations in July for the *same* ZIPs. New ZIPs only have July
+#    features, so we also train on the seen ZIPs' July features, paired with their June
+#    target, which puts training and test on the same footing.
+# 5. **Missing rent is filled from the same ZIP's other months, including July.** July
+#    rent is almost never missing.
 #
-# Only competition files are used (external data is banned by the rules).
+# Validation copies the test: K-fold **over ZIPs**, so a validation ZIP is never seen in
+# training, and we score its July-feature row against its June target.
 
 # %%
 import os
@@ -19,339 +32,306 @@ import warnings
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from scipy.stats import norm
-from sklearn.model_selection import GroupKFold
-from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import KFold
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR = os.environ.get(
-    "DATA_DIR", "/kaggle/input/predicting-housing-affordability-in-the-u-s"
-)
-TARGET = "AffordabilityPercentageTrue"
-SEED = 42
+DATA_DIR = os.environ.get("DATA_DIR", "/kaggle/input/predicting-housing-affordability-in-the-u-s")
+T = "AffordabilityPercentageTrue"
 N_FOLDS = 5
-W_NEW = 0.6  # weight of the New-ZIP RMSE in the final score; check the Evaluation page
+SEEDS = [0, 1, 2]           # more seeds = steadier predictions (costs run time)
 USE_CATBOOST = True
-
 try:
     from catboost import CatBoostRegressor
 except ImportError:
     USE_CATBOOST = False
 
 
-def rmse(y, p):
-    return float(np.sqrt(mean_squared_error(y, p)))
+def rmse(a, b):
+    return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
 
 
 # %% [markdown]
-# ## Load & normalise
-# Column names differ slightly between the data page (`Zip`, `YearMonth`/`Month`) and the
-# submission (`ZipCode`), so normalise them. ZIPs must stay 5-digit strings.
+# ## 1. Load data
+# ZIPs are read as text so `01002` keeps its leading zero.
 
 # %%
-def load(name):
-    df = pd.read_csv(os.path.join(DATA_DIR, name), dtype={"Zip": str, "ZipCode": str})
-    df = df.rename(columns={"ZipCode": "Zip", "YearMonth": "Month"})
-    df["Zip"] = df["Zip"].astype(str).str.split(".").str[0].str.zfill(5)
-    if "Month" in df.columns:
-        df["Month"] = pd.to_datetime(df["Month"]).dt.month
-    return df
+train = pd.read_csv(f"{DATA_DIR}/train.csv", dtype={"Zip": str})
+test = pd.read_csv(f"{DATA_DIR}/test.csv", dtype={"Zip": str})
+sample = pd.read_csv(f"{DATA_DIR}/sample_submission.csv", dtype={"Zip": str})
+for d in (train, test):
+    d["m"] = pd.to_datetime(d["Month"]).dt.month
 
-
-train = load("train.csv")
-test = load("test.csv")
-sample = load("sample_submission.csv")
-print(train.shape, test.shape, sample.shape)
-print(train["Month"].value_counts())
-
-seen_zips = set(train["Zip"])
-test["is_seen"] = test["Zip"].isin(seen_zips)
-print("Test seen ZIPs:", test["is_seen"].sum(), " new ZIPs:", (~test["is_seen"]).sum())
+seen = set(train["Zip"])
+test["is_seen"] = test["Zip"].isin(seen)
+print(train.shape, test.shape)
+print("test seen ZIPs:", test.is_seen.sum(), "| new ZIPs:", (~test.is_seen).sum())
 
 # %% [markdown]
-# ## Quick EDA: how stable is the target month to month?
-# If May→June correlation is ~1, the last known value is the backbone for Seen ZIPs.
+# ## 2. Quick EDA: the facts the plan is built on
 
 # %%
-wide = train.pivot_table(index="Zip", columns="Month", values=TARGET)
-if wide.shape[1] >= 2:
-    both = wide.dropna()
-    m0, m1 = both.columns[:2]
-    print(f"ZIPs in both months: {len(both)}")
-    print(f"corr(M{m0}, M{m1}) = {both[m0].corr(both[m1]):.4f}")
-    print(f"RMSE of 'June = May' baseline: {rmse(both[m1], both[m0]):.4f}")
-print(train.isna().mean().sort_values(ascending=False).head(10))
+may = train[train.m == 5].set_index("Zip")
+jun = train[train.m == 6].set_index("Zip").loc[may.index]
+drift = jun[T] - may[T]
+print(f"corr(May, June) = {may[T].corr(jun[T]):.4f}")
+print(f"RMSE 'June = May' = {rmse(jun[T], may[T]):.3f}, mean change = {drift.mean():.3f}")
+print("\nMean target by state (top 10 by count):")
+print(train[train.m == 6].groupby("State")[T].agg(["mean", "count"])
+      .sort_values("count", ascending=False).head(10).round(1))
+shift_cols = ["AvgNumberofAdults", "AvgHouseholdSize", "YoungAdultinHouseholdPercent",
+              "SeniorAdultinHouseholdPercent"]
+t7 = test[test.is_seen].set_index("Zip")[shift_cols]
+print("\nJuly minus June feature shift (same ZIPs), in std units:")
+print(((t7 - jun.loc[t7.index, shift_cols]).mean() / jun[shift_cols].std()).round(2))
 
 # %% [markdown]
-# ## Feature engineering
-# The target is "share of households whose housing cost ≤ 30% of income", so the key
-# signal is **rent vs income**. If incomes are roughly log-normal around the median,
-# share affordable ≈ Φ(log(0.3·income / annual_rent) / σ) — we add that as a feature.
+# ## 3. Seen ZIPs: June value + state drift
+# We learn how much each state's affordability moved from May to June, shrunk toward the
+# national average for small states, and assume July moves the same way.
+# Checked on May→June: plain "same as last month" = 1.25 RMSE; with state drift ≈ 1.17.
+
+# %%
+DRIFT_ALPHA = 20  # shrinkage: small states lean on the national drift
+g = pd.DataFrame({"d": drift, "State": may["State"]}).groupby("State")["d"].agg(["sum", "count"])
+state_drift = (g["sum"] + drift.mean() * DRIFT_ALPHA) / (g["count"] + DRIFT_ALPHA)
+
+
+def get_drift(states):
+    return states.map(state_drift).fillna(drift.mean()).values
+
+
+# sanity check on May -> June with out-of-fold drift estimates
+chk = np.zeros(len(may))
+for a, b in KFold(5, shuffle=True, random_state=0).split(may):
+    gg = pd.DataFrame({"d": drift.iloc[a], "S": may["State"].iloc[a]}).groupby("S")["d"].agg(["sum", "count"])
+    sd = (gg["sum"] + drift.iloc[a].mean() * DRIFT_ALPHA) / (gg["count"] + DRIFT_ALPHA)
+    chk[b] = may[T].iloc[b].values + may["State"].iloc[b].map(sd).fillna(drift.iloc[a].mean()).values
+print(f"Seen-ZIP proxy RMSE (May->June): no drift {rmse(jun[T], may[T]):.3f} | "
+      f"state drift {rmse(jun[T], chk):.3f}")
+
+# %% [markdown]
+# ## 4. Features for the new-ZIP model
+# * **Rent vs income:** `log(income / (40 × rent))`. A household is affordable when
+#   yearly rent ≤ 30% of income, i.e. income ≥ 40 × monthly rent.
+# * **Household mix:** children per adult, income per person, owner/renter × rent burden.
+# * **"Compared with neighbours":** each ZIP's value minus the average of its zip3, metro,
+#   state and city in the same month. This separates "rich for this area" from "rich area".
+# * Rent gaps are filled from the same ZIP's other months, then from area medians.
+
+# %%
+al = pd.concat([train, test], ignore_index=True)
+al["zip3"] = al.Zip.str[:3]
+al["zipn"] = al.Zip.astype(int)
+al["City"] = al.State + "_" + al.City.fillna("NA")
+al["Metro"] = al.Metro.fillna("NA")
+al["rent"] = al.RentIndex.fillna(al.groupby("Zip").RentIndex.transform("median"))
+for k in ["City", "zip3", "Metro", "State"]:
+    al["rent"] = al.rent.fillna(al.groupby(["m", k]).RentIndex.transform("median"))
+
+inc = al.AnnualMedianHouseholdIncome
+al["lir"] = np.log(inc / (al.rent * 40))
+al["rent_inc"] = al.rent * 12 / inc
+al["log_inc"] = np.log(inc)
+al["log_rent"] = np.log(al.rent)
+al["kids_per_adult"] = al.AvgNumberofChildren / al.AvgNumberofAdults
+al["inc_per_person"] = inc / al.AvgHouseholdSize
+al["own_x_lir"] = al.OwnerPercent * al.lir
+al["rent_x_lir"] = al.RenterPercent * al.lir
+
+BASE = ["SampleSize", "rent", "AnnualMedianHouseholdIncome", "OwnerPercent",
+        "MedianHomeLengthofResidence", "AvgNumberofChildren", "AvgNumberofAdults",
+        "AvgHouseholdSize", "AvgGenerationsinHousehold", "YoungAdultinHouseholdPercent",
+        "SeniorAdultinHouseholdPercent", "zipn"]
+ENG = ["lir", "rent_inc", "log_inc", "log_rent", "kids_per_adult", "inc_per_person",
+       "own_x_lir", "rent_x_lir"]
+REL = []
+for grp in ["zip3", "Metro", "State", "City"]:
+    for c in ["log_inc", "log_rent", "lir", "OwnerPercent", "AvgNumberofChildren",
+              "MedianHomeLengthofResidence", "SeniorAdultinHouseholdPercent"]:
+        name = f"{c}_rel_{grp}"
+        al[name] = al[c] - al.groupby(["m", grp])[c].transform("mean")
+        REL.append(name)
+for c in ["State", "Metro", "zip3", "City"]:
+    al[c] = al[c].astype("category")
+FEATS = BASE + ENG + REL + ["State"]
+print(len(FEATS), "feature columns")
+
+# %% [markdown]
+# ## 5. Neighbour features (built only from labels the model is allowed to see)
+# For each ZIP we look up **known** ZIPs near it:
+# * average target of its state / metro / zip3 / city (smoothed toward the overall mean
+#   when a group has few ZIPs);
+# * the targets of the 1, 3 and 8 closest ZIP numbers (ZIP numbers that are close are
+#   usually close on the map).
 #
-# Features are built on train+test *predictors* together (no labels), which is allowed.
+# To avoid cheating, a ZIP's own label is never used for its own features. Inside
+# training this is done with an inner K-fold.
 
 # %%
-NUM_COLS = [
-    "SampleSize", "RentIndex", "AnnualMedianHouseholdIncome", "OwnerPercent",
-    "RenterPercent", "MedianHomeLengthofResidence", "AvgNumberofChildren",
-    "AvgNumberofAdults", "AvgHouseholdSize", "AvgGenerationsinHousehold",
-    "YoungAdultinHouseholdPercent", "SeniorAdultinHouseholdPercent",
-]
-CAT_COLS = ["State", "City", "Metro", "zip3", "zip2"]
+zips = np.array(sorted(seen))
+y_jun = train[train.m == 6].set_index("Zip")[T]
+y_may = train[train.m == 5].set_index("Zip")[T]
+zinfo = al[al.m == 6].set_index("Zip").loc[zips, ["zipn", "State", "Metro", "zip3", "City"]]
+zinfo["y"] = y_jun.loc[zips]
 
 
-def build_features(df):
-    df = df.copy()
-    df["zip3"] = df["Zip"].str[:3]
-    df["zip2"] = df["Zip"].str[:2]
-    df["zip_num"] = df["Zip"].astype(int)
-    for c in ["State", "City", "Metro"]:
-        df[c] = df[c].fillna("NA").astype(str)
-    df["City"] = df["State"] + "_" + df["City"]
-
-    # RentIndex is missing for many ZIPs: impute hierarchically from the same ZIP in another
-    # month, then City -> zip3 -> Metro -> State medians (all within the same month).
-    df["rent_missing"] = df["RentIndex"].isna().astype(int)
-    df["rent_imp"] = df["RentIndex"]
-    df["rent_imp"] = df["rent_imp"].fillna(df.groupby("Zip")["RentIndex"].transform("median"))
-    for keys in (["Month", "City"], ["Month", "zip3"], ["Month", "Metro"], ["Month", "State"],
-                 ["Month"]):
-        df["rent_imp"] = df["rent_imp"].fillna(df.groupby(keys)["RentIndex"].transform("median"))
-
-    inc = df["AnnualMedianHouseholdIncome"]
-    rent_y = df["rent_imp"] * 12
-    df["log_income"] = np.log1p(inc)
-    df["log_rent"] = np.log1p(df["rent_imp"])
-    df["rent_to_income"] = rent_y / inc
-    df["log_income_over_rent"] = np.log(inc / rent_y)
-    df["income_needed_ratio"] = inc / (rent_y / 0.30)  # >1 means median household affords rent
-    for sigma in (0.6, 0.9, 1.2):
-        df[f"phi_{sigma}"] = norm.cdf(np.log(0.30 * inc / rent_y) / sigma) * 100
-    df["renter_x_burden"] = df["RenterPercent"] * df["rent_to_income"]
-    df["owner_x_burden"] = df["OwnerPercent"] * df["rent_to_income"]
-    df["income_per_person"] = inc / df["AvgHouseholdSize"]
-    df["income_per_adult"] = inc / df["AvgNumberofAdults"]
-    df["rent_per_person"] = df["rent_imp"] / df["AvgHouseholdSize"]
-    df["log_sample"] = np.log1p(df["SampleSize"])
-
-    # Relative position within the area (is this ZIP richer/cheaper than its neighbours?)
-    for grp in ["zip3", "Metro", "State"]:
-        for c in ["log_income", "log_rent", "rent_to_income", "RenterPercent"]:
-            df[f"{c}_rel_{grp}"] = df[c] - df.groupby(["Month", grp])[c].transform("median")
-        df[f"cnt_{grp}"] = df.groupby(["Month", grp])["Zip"].transform("count")
-    return df
+def target_feats(fit_z, rows, k=8):
+    f = zinfo.loc[fit_z]
+    prior = f.y.mean()
+    out = pd.DataFrame(index=rows.index)
+    for c, a in [("State", 20), ("Metro", 5), ("zip3", 5), ("City", 3)]:
+        s = f.groupby(c, observed=True).y.agg(["sum", "count"])
+        key = rows[c].astype(object)
+        n = key.map(s["count"]).astype(float).fillna(0)
+        out["te_" + c] = (key.map(s["sum"]).astype(float).fillna(0) + prior * a) / (n + a)
+        out["n_" + c] = n
+    fz, fy = f.zipn.values, f.y.values
+    o = np.argsort(fz)
+    fz, fy = fz[o], fy[o]
+    q = rows.zipn.values
+    idx = np.searchsorted(fz, q)
+    cand = np.stack([np.clip(idx + d, 0, len(fz) - 1) for d in range(-k, k)], 1)
+    dist = np.abs(fz[cand] - q[:, None]).astype(float)
+    order = np.argsort(dist, 1)[:, :k]
+    cand, dist = np.take_along_axis(cand, order, 1), np.take_along_axis(dist, order, 1)
+    for kk in (1, 3, 8):
+        w = 1 / (1 + dist[:, :kk])
+        out[f"knn{kk}"] = (fy[cand[:, :kk]] * w).sum(1) / w.sum(1)
+    out["knn_d1"] = dist[:, 0]
+    out["knn_std"] = fy[cand].std(1)
+    return out
 
 
-full = pd.concat([train.assign(_set="train"), test.assign(_set="test")], ignore_index=True)
-full = build_features(full)
-for c in CAT_COLS:
-    full[c] = full[c].astype("category")
-train_f = full[full["_set"] == "train"].reset_index(drop=True)
-test_f = full[full["_set"] == "test"].reset_index(drop=True)
-
-BASE_FEATS = [c for c in full.columns
-              if c not in {"Zip", TARGET, "_set", "is_seen", "City"}]
-print(len(BASE_FEATS), "base features")
-
-# %% [markdown]
-# ## Out-of-fold target encoding (geographic neighbours)
-# For New ZIPs the best extra signal is "how affordable are nearby ZIPs we *do* know".
-# Encodings are computed strictly out-of-fold, grouped by ZIP, to avoid leakage.
-
-# %%
-TE_COLS = ["zip3", "zip2", "Metro", "City", "State"]
+def inner_target_feats(fit_z, rows):
+    """target features for training rows, each computed without its own ZIP's fold"""
+    fit_z = np.array(fit_z)
+    parts = []
+    for a, b in KFold(5, shuffle=True, random_state=11).split(fit_z):
+        parts.append(target_feats(fit_z[a], rows[rows.Zip.isin(set(fit_z[b]))]))
+    return pd.concat(parts).loc[rows.index]
 
 
-def te_map(src, col, prior, alpha=10):
-    g = src.groupby(col, observed=True)[TARGET].agg(["sum", "count"])
-    return (g["sum"] + prior * alpha) / (g["count"] + alpha)
-
-
-def add_te(fit_df, apply_df, n_inner=5):
-    """TE for apply_df from all of fit_df; TE for fit_df from inner out-of-fold splits."""
-    fit_df, apply_df = fit_df.copy(), apply_df.copy()
-    prior = fit_df[TARGET].mean()
-    gkf = GroupKFold(n_splits=n_inner)
-    for col in TE_COLS:
-        name = f"te_{col}"
-        apply_df[name] = apply_df[col].astype(str).map(
-            te_map(fit_df.assign(**{col: fit_df[col].astype(str)}), col, prior)
-        ).fillna(prior).astype(float)
-        fit_df[name] = np.nan
-        for tr, va in gkf.split(fit_df, groups=fit_df["Zip"]):
-            src = fit_df.iloc[tr].assign(**{col: fit_df[col].iloc[tr].astype(str)})
-            fit_df.iloc[va, fit_df.columns.get_loc(name)] = (
-                fit_df[col].iloc[va].astype(str).map(te_map(src, col, prior)).fillna(prior).values
-            )
-    # residual of the zip3 encoding vs the rent-to-income curve
-    for d in (fit_df, apply_df):
-        d["te_zip3_minus_phi"] = d["te_zip3"] - d["phi_0.9"]
-    return fit_df, apply_df
-
-
-TE_FEATS = [f"te_{c}" for c in TE_COLS] + ["te_zip3_minus_phi"]
-FEATS_A = BASE_FEATS + TE_FEATS
-
-# %% [markdown]
-# ## Model A – geographic generalisation (GroupKFold by ZIP)
-
-# %%
-LGB_PARAMS = dict(
-    objective="regression", learning_rate=0.03, num_leaves=31, min_child_samples=30,
-    subsample=0.8, subsample_freq=1, colsample_bytree=0.7, reg_lambda=1.0,
-    n_estimators=5000, random_state=SEED, verbose=-1,
-)
-
-
-def fit_lgb(Xtr, ytr, Xva=None, yva=None, n_est=None):
-    params = dict(LGB_PARAMS)
-    if n_est:
-        params["n_estimators"] = n_est
-    m = lgb.LGBMRegressor(**params)
-    if Xva is not None:
-        m.fit(Xtr, ytr, eval_set=[(Xva, yva)],
-              callbacks=[lgb.early_stopping(200, verbose=False)])
-    else:
-        m.fit(Xtr, ytr)
-    return m
-
-
-def fit_cat(Xtr, ytr, Xva=None, yva=None, n_est=None):
-    m = CatBoostRegressor(
-        iterations=n_est or 5000, learning_rate=0.05, depth=6, loss_function="RMSE",
-        random_seed=SEED, verbose=0, cat_features=[c for c in CAT_COLS if c in Xtr.columns],
-    )
-    Xtr = Xtr.copy()
-    for c in CAT_COLS:
-        if c in Xtr:
-            Xtr[c] = Xtr[c].astype(str)
-    if Xva is not None:
-        Xva = Xva.copy()
-        for c in CAT_COLS:
-            if c in Xva:
-                Xva[c] = Xva[c].astype(str)
-        m.fit(Xtr, ytr, eval_set=(Xva, yva), early_stopping_rounds=200)
-    else:
-        m.fit(Xtr, ytr)
-    return m
-
-
-def pred(m, X):
-    if USE_CATBOOST and isinstance(m, CatBoostRegressor):
-        X = X.copy()
-        for c in CAT_COLS:
-            if c in X:
-                X[c] = X[c].astype(str)
-    return m.predict(X)
-
-
-y = train_f[TARGET].values
-oof_a = {"lgb": np.zeros(len(train_f)), "cat": np.zeros(len(train_f))}
-best_it = {"lgb": [], "cat": []}
-gkf = GroupKFold(n_splits=N_FOLDS)
-for fold, (tr, va) in enumerate(gkf.split(train_f, y, groups=train_f["Zip"])):
-    ftr, fva = add_te(train_f.iloc[tr], train_f.iloc[va])
-    m = fit_lgb(ftr[FEATS_A], y[tr], fva[FEATS_A], y[va])
-    oof_a["lgb"][va] = m.predict(fva[FEATS_A])
-    best_it["lgb"].append(m.best_iteration_)
-    if USE_CATBOOST:
-        m = fit_cat(ftr[FEATS_A], y[tr], fva[FEATS_A], y[va])
-        oof_a["cat"][va] = pred(m, fva[FEATS_A])
-        best_it["cat"].append(m.get_best_iteration())
-    print(f"fold {fold}: lgb {rmse(y[va], oof_a['lgb'][va]):.4f}"
-          + (f"  cat {rmse(y[va], oof_a['cat'][va]):.4f}" if USE_CATBOOST else ""))
-
-oof_a_blend = (oof_a["lgb"] + oof_a["cat"]) / 2 if USE_CATBOOST else oof_a["lgb"]
-print(f"Model A (new-ZIP proxy) CV RMSE  lgb={rmse(y, oof_a['lgb']):.4f}"
-      + (f"  cat={rmse(y, oof_a['cat']):.4f}  blend={rmse(y, oof_a_blend):.4f}"
-         if USE_CATBOOST else ""))
-train_f["oof_a"] = oof_a_blend
-
-# %% [markdown]
-# ## Model B – Seen ZIPs (predict a month from the ZIP's other month)
-# Training pairs are built in both directions (May→June and June→May) so we have enough
-# rows. Features: Model A prediction, lag target, lag features, and month-over-month deltas.
-# The model learns a *correction* on top of the lag target.
-
-# %%
-DELTA_COLS = ["RentIndex", "rent_imp", "AnnualMedianHouseholdIncome", "OwnerPercent",
-              "RenterPercent", "SampleSize", "rent_to_income", "phi_0.9", "AvgHouseholdSize"]
-
-
-def make_pairs(cur, prev):
-    """cur: rows to predict; prev: the same ZIPs' earlier/other-month rows (with target)."""
-    p = prev[["Zip", "Month", TARGET, "oof_a"] + DELTA_COLS].rename(
-        columns={"Month": "lag_month", TARGET: "lag_target", "oof_a": "lag_oof_a",
-                 **{c: f"lag_{c}" for c in DELTA_COLS}})
-    d = cur.merge(p, on="Zip", how="inner")
-    d["gap"] = d["Month"] - d["lag_month"]
-    for c in DELTA_COLS:
-        d[f"d_{c}"] = d[c] - d[f"lag_{c}"]
-    # "what model A thinks changed" + the ZIP's own persistent residual
-    d["lag_resid"] = d["lag_target"] - d["lag_oof_a"]
-    d["a_shift"] = d["oof_a"] - d["lag_oof_a"]
+def rows_for(zs, months=(5, 6, 7)):
+    """May rows get May labels; June and July rows get the June label."""
+    d = al[al.Zip.isin(set(zs)) & al.m.isin(months)].copy()
+    d["y"] = np.where(d.m == 5, d.Zip.map(y_may), d.Zip.map(y_jun))
     return d
 
 
-may, jun = train_f[train_f["Month"] == 5], train_f[train_f["Month"] == 6]
-pairs = pd.concat([make_pairs(jun, may), make_pairs(may, jun)], ignore_index=True)
-FEATS_B = (["oof_a", "lag_target", "lag_resid", "a_shift", "gap"]
-           + [f"d_{c}" for c in DELTA_COLS] + BASE_FEATS)
-pairs["resid_target"] = pairs[TARGET] - pairs["lag_target"]
-print("pair rows:", len(pairs))
-
-oof_b = np.zeros(len(pairs))
-best_it_b = []
-if len(pairs) >= N_FOLDS * 10:
-    for tr, va in GroupKFold(n_splits=N_FOLDS).split(pairs, groups=pairs["Zip"]):
-        m = fit_lgb(pairs.iloc[tr][FEATS_B], pairs["resid_target"].iloc[tr],
-                    pairs.iloc[va][FEATS_B], pairs["resid_target"].iloc[va])
-        oof_b[va] = pairs["lag_target"].iloc[va] + m.predict(pairs.iloc[va][FEATS_B])
-        best_it_b.append(m.best_iteration_)
-    yb = pairs[TARGET].values
-    print(f"Seen-ZIP baseline (lag target)  RMSE={rmse(yb, pairs['lag_target']):.4f}")
-    print(f"Seen-ZIP Model A only           RMSE={rmse(yb, pairs['oof_a']):.4f}")
-    print(f"Seen-ZIP Model B                RMSE={rmse(yb, oof_b):.4f}")
-    seen_cv = rmse(yb, oof_b)
-    new_cv = rmse(y, oof_a_blend)
-    print(f"Estimated final score ≈ {(1 - W_NEW) * seen_cv + W_NEW * new_cv:.4f}")
-
 # %% [markdown]
-# ## Fit on all training data & predict July
+# ## 6. Models: LightGBM + CatBoost
+# Two different gradient-boosting libraries make different mistakes, so averaging them
+# usually beats either one.
 
 # %%
-train_te, test_te = add_te(train_f, test_f)
-n_lgb = int(np.mean(best_it["lgb"]) * 1.1) or 1000
-pa = fit_lgb(train_te[FEATS_A], y, n_est=n_lgb).predict(test_te[FEATS_A])
+LGB_PARAMS = dict(n_estimators=6000, learning_rate=0.02, num_leaves=31, min_child_samples=40,
+                  subsample=0.8, subsample_freq=1, colsample_bytree=0.3, reg_lambda=5,
+                  verbose=-1)
+CAT_PARAMS = dict(iterations=6000, learning_rate=0.04, depth=6, l2_leaf_reg=5,
+                  loss_function="RMSE", verbose=0)
+
+
+def to_cat(X):
+    X = X.copy()
+    for c in X.columns:
+        if str(X[c].dtype) == "category":
+            X[c] = X[c].astype(str)
+    return X
+
+
+def fit_model(kind, seed, XA, ya, XB=None, yb=None, n_iter=None):
+    if kind == "lgb":
+        p = dict(LGB_PARAMS, random_state=seed)
+        if n_iter:
+            p["n_estimators"] = n_iter
+        m = lgb.LGBMRegressor(**p)
+        if XB is not None:
+            m.fit(XA, ya, eval_set=[(XB, yb)], callbacks=[lgb.early_stopping(300, verbose=False)])
+            return m, m.best_iteration_
+        return m.fit(XA, ya), n_iter
+    p = dict(CAT_PARAMS, random_seed=seed)
+    if n_iter:
+        p["iterations"] = n_iter
+    cats = [c for c in XA.columns if str(XA[c].dtype) == "category"]
+    m = CatBoostRegressor(**p, cat_features=cats)
+    if XB is not None:
+        m.fit(to_cat(XA), ya, eval_set=(to_cat(XB), yb), early_stopping_rounds=300)
+        return m, m.get_best_iteration()
+    return m.fit(to_cat(XA), ya), n_iter
+
+
+def predict(m, X):
+    if USE_CATBOOST and isinstance(m, CatBoostRegressor):
+        return m.predict(to_cat(X))
+    return m.predict(X)
+
+
+KINDS = ["lgb"] + (["cat"] if USE_CATBOOST else [])
+
+# %% [markdown]
+# ## 7. Cross-validation that copies the "new ZIP" test
+# Each fold hides 20% of ZIPs completely: all of their months and their labels. We train
+# on the rest and predict the hidden ZIPs from their **July** features.
+
+# %%
+oof = {k: pd.Series(0.0, index=zips) for k in KINDS}
+best_iters = {k: [] for k in KINDS}
+for a, b in KFold(N_FOLDS, shuffle=True, random_state=100).split(zips):
+    za, zb = zips[a], zips[b]
+    A, B = rows_for(za), rows_for(zb, (7,))
+    XA = pd.concat([A[FEATS], inner_target_feats(za, A)], axis=1)
+    XB = pd.concat([B[FEATS], target_feats(za, B)], axis=1)
+    for k in KINDS:
+        m, it = fit_model(k, 0, XA, A.y, XB, B.y)
+        oof[k].loc[B.Zip.values] = predict(m, XB)
+        best_iters[k].append(it)
+    print("fold done:", {k: round(rmse(y_jun.loc[zb], oof[k].loc[zb]), 3) for k in KINDS})
+
+for k in KINDS:
+    print(f"{k}: new-ZIP CV RMSE = {rmse(y_jun.loc[zips], oof[k]):.4f}, "
+          f"mean best iters = {int(np.mean(best_iters[k]))}")
+
+# best blend weight (simple grid)
 if USE_CATBOOST:
-    n_cat = int(np.mean(best_it["cat"]) * 1.1) or 1000
-    pa = (pa + pred(fit_cat(train_te[FEATS_A], y, n_est=n_cat), test_te[FEATS_A])) / 2
-test_f["oof_a"] = pa  # Model A prediction plays the same role as oof_a in training
-test_f["pred"] = pa
-
-# Seen ZIPs: use the most recent labelled month (June if present, else May)
-last = train_f.sort_values("Month").groupby("Zip").tail(1)
-if best_it_b:
-    mb = fit_lgb(pairs[FEATS_B], pairs["resid_target"], n_est=int(np.mean(best_it_b) * 1.1) or 500)
-    tp = make_pairs(test_f, last)
-    tp["pred_b"] = tp["lag_target"] + mb.predict(tp[FEATS_B])
-    test_f = test_f.merge(tp[["Zip", "pred_b"]], on="Zip", how="left")
-    test_f["pred"] = test_f["pred_b"].fillna(test_f["pred"])
-
-test_f["pred"] = test_f["pred"].clip(0, 100)
+    ws = np.linspace(0, 1, 21)
+    scores = [rmse(y_jun.loc[zips], w * oof["lgb"] + (1 - w) * oof["cat"]) for w in ws]
+    W_LGB = float(ws[int(np.argmin(scores))])
+    print(f"blend: w_lgb={W_LGB:.2f}  RMSE={min(scores):.4f}")
+else:
+    W_LGB = 1.0
 
 # %% [markdown]
-# ## Write submission in the sample's order / columns
+# ## 8. Train on all seen ZIPs and predict the new ZIPs
 
 # %%
-sub = sample.rename(columns={"Zip": "ZipCode"}).copy()
-key = test_f.assign(ZipCode=test_f["Zip"]).drop_duplicates(["ZipCode", "State"])
-sub = sub.drop(columns=[TARGET]).merge(
-    key[["ZipCode", "State", "pred"]].rename(columns={"pred": TARGET}),
-    on=["ZipCode", "State"], how="left")
-sub[TARGET] = sub[TARGET].fillna(float(np.mean(y))).clip(0, 100)
-assert sub[TARGET].notna().all() and np.isfinite(sub[TARGET]).all()
-assert len(sub) == len(sample)
+A = rows_for(zips)
+XA = pd.concat([A[FEATS], inner_target_feats(zips, A)], axis=1)
+new_rows = al[(al.m == 7) & (~al.Zip.isin(seen))].copy()
+XN = pd.concat([new_rows[FEATS], target_feats(zips, new_rows)], axis=1)
+
+pred_new = np.zeros(len(new_rows))
+for k in KINDS:
+    w = W_LGB if k == "lgb" else 1 - W_LGB
+    n_iter = int(np.mean(best_iters[k]) * 1.15)
+    for s in SEEDS:
+        m, _ = fit_model(k, s, XA, A.y, n_iter=n_iter)
+        pred_new += w * predict(m, XN) / len(SEEDS)
+# model predicts a June-level value; move it to July with the state drift
+pred_new += get_drift(new_rows.State.astype(str))
+new_pred = pd.Series(pred_new, index=new_rows.Zip.values)
+
+# %% [markdown]
+# ## 9. Seen ZIPs + write the submission
+
+# %%
+seen_pred = pd.Series(y_jun.values + get_drift(jun.loc[y_jun.index, "State"]), index=y_jun.index)
+pred = pd.concat([seen_pred, new_pred])
+
+sub = sample.copy()
+sub[T] = sub.Zip.map(pred).clip(0, 100)
+assert sub[T].notna().all() and np.isfinite(sub[T]).all()
+assert len(sub) == len(test) and sub.Zip.str.len().eq(5).all()
 sub.to_csv("submission.csv", index=False)
-print(sub.head(), sub.shape)
+print(sub.head())
+print(sub[T].describe())
