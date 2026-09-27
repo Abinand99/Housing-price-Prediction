@@ -42,7 +42,8 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | + engineered + "relative to area" features + neighbour labels, no raw high-cardinality categories | 11.99 |
 | + `colsample_bytree=0.3` | 11.95 |
 | Extra ideas: neighbour feature differences, residual kriging | no gain |
-| LightGBM + CatBoost blend | see notebook output |
+| LightGBM alone / CatBoost alone | 11.95 / 12.02 |
+| **LightGBM + CatBoost blend (0.6 / 0.4)** | **11.87** |
 
 ## Ideas not tried yet
 
