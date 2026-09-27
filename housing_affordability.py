@@ -122,6 +122,7 @@ print(f"Seen-ZIP proxy RMSE (May->June): no drift {rmse(jun[T], may[T]):.3f} | "
 # %%
 al = pd.concat([train, test], ignore_index=True)
 al["zip3"] = al.Zip.str[:3]
+al["zip4"] = al.Zip.str[:4]
 al["zipn"] = al.Zip.astype(int)
 al["City"] = al.State + "_" + al.City.fillna("NA")
 al["Metro"] = al.Metro.fillna("NA")
@@ -163,7 +164,9 @@ print(len(FEATS), "feature columns")
 # * average target of its state / metro / zip3 / city (smoothed toward the overall mean
 #   when a group has few ZIPs);
 # * the targets of the 1, 3 and 8 closest ZIP numbers (ZIP numbers that are close are
-#   usually close on the map).
+#   usually close on the map), and the average for the first 4 ZIP digits;
+# * "look-alike neighbours": known ZIPs in the same zip3 weighted by how similar they are
+#   in rent/income, owner % and children (added after error analysis, CV −0.03 to −0.04).
 #
 # To avoid cheating, a ZIP's own label is never used for its own features. Inside
 # training this is done with an inner K-fold.
@@ -174,6 +177,25 @@ y_jun = train[train.m == 6].set_index("Zip")[T]
 y_may = train[train.m == 5].set_index("Zip")[T]
 zinfo = al[al.m == 6].set_index("Zip").loc[zips, ["zipn", "State", "Metro", "zip3", "City"]]
 zinfo["y"] = y_jun.loc[zips]
+zinfo["zip4"] = al[al.m == 6].set_index("Zip").loc[zips, "zip4"]
+SIM_COLS = ["lir", "OwnerPercent", "AvgNumberofChildren"]
+SIM_SCALE = np.array([0.3, 15, 0.12])  # "how different is different" for each column
+jun_feats = al[al.m == 6].set_index("Zip").loc[zips, ["zip3"] + SIM_COLS]
+
+
+def similar_neighbours(fit_z, rows):
+    """Average target of known ZIPs in the same zip3, weighted by how similar they are
+    in rent/income, owner % and children."""
+    ref = jun_feats.loc[fit_z].assign(y=zinfo.loc[fit_z, "y"].values)
+    groups = {g: (d[SIM_COLS].values, d.y.values) for g, d in ref.groupby("zip3", observed=True)}
+    out = np.full(len(rows), np.nan)
+    for i, (z3, *x) in enumerate(rows[["zip3"] + SIM_COLS].itertuples(index=False)):
+        if z3 not in groups:
+            continue
+        X, yy = groups[z3]
+        w = np.exp(-0.5 * (((X - np.array(x)) / SIM_SCALE) ** 2).sum(1)) + 1e-6
+        out[i] = (yy * w).sum() / w.sum()
+    return out
 
 
 def target_feats(fit_z, rows, k=8):
@@ -200,6 +222,11 @@ def target_feats(fit_z, rows, k=8):
         out[f"knn{kk}"] = (fy[cand[:, :kk]] * w).sum(1) / w.sum(1)
     out["knn_d1"] = dist[:, 0]
     out["knn_std"] = fy[cand].std(1)
+    # finer geography: first 4 ZIP digits
+    s4 = f.groupby("zip4").y.agg(["sum", "count"])
+    key4 = rows["zip4"]
+    out["te_zip4"] = (key4.map(s4["sum"]).fillna(0) + prior * 3) / (key4.map(s4["count"]).fillna(0) + 3)
+    out["sim_zip3"] = similar_neighbours(fit_z, rows)
     return out
 
 
@@ -300,6 +327,37 @@ if USE_CATBOOST:
     print(f"blend: w_lgb={W_LGB:.2f}  RMSE={min(scores):.4f}")
 else:
     W_LGB = 1.0
+
+# %% [markdown]
+# ## 7b. Error analysis: how good is it, and where does it miss?
+# RMSE is the typical miss in percentage points (bigger misses count extra). Also shown:
+# how often we land within ±5 / ±10 points, and which kinds of ZIPs are hardest.
+
+# %%
+blend = (W_LGB * oof["lgb"] + (1 - W_LGB) * oof[KINDS[-1]] if USE_CATBOOST else oof["lgb"]).clip(0, 100)
+ea = pd.DataFrame({"y": y_jun.loc[zips].values, "p": blend.values,
+                   "State": zinfo.State.astype(str).values,
+                   "SampleSize": jun.loc[zips, "SampleSize"].values}, index=zips)
+ea["err"] = ea.p - ea.y
+print(f"RMSE {rmse(ea.y, ea.p):.2f} | MAE {ea.err.abs().mean():.2f} | "
+      f"R² {1 - (ea.err ** 2).sum() / ((ea.y - ea.y.mean()) ** 2).sum():.3f} | "
+      f"'always predict the average' RMSE {ea.y.std():.2f}")
+for k in (5, 10, 20):
+    print(f"within ±{k} points: {(ea.err.abs() <= k).mean() * 100:.0f}%")
+
+
+def _rmse(s):
+    return np.sqrt((s ** 2).mean())
+
+
+print("\nBy true value (bias > 0 means we predict too high):")
+print(ea.groupby(pd.cut(ea.y, [-1, 0, 10, 30, 50, 70, 90, 100]), observed=True)["err"]
+      .agg(n="size", bias="mean", rmse=_rmse).round(1))
+print("\nBy household sample size (small samples = noisier target):")
+print(ea.groupby(pd.qcut(ea.SampleSize, 5))["err"].agg(_rmse).round(2))
+print("\nLargest states:")
+print(ea.groupby("State")["err"].agg(n="size", bias="mean", rmse=_rmse)
+      .sort_values("n", ascending=False).head(10).round(1))
 
 # %% [markdown]
 # ## 8. Train on all seen ZIPs and predict the new ZIPs
