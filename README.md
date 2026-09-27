@@ -44,7 +44,8 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | Extra ideas: neighbour feature differences, residual kriging | no gain |
 | LightGBM alone / CatBoost alone | 11.95 / 12.02 |
 | LightGBM + CatBoost blend (0.6 / 0.4) | 11.87 |
-| **+ zip4 average + look-alike neighbours (blend)** | **11.85** (MAE 8.8, R² 0.83, 66% within ±10) |
+| + zip4 average + look-alike neighbours (blend) | 11.85 |
+| **+ extra_trees, train on June+July rows only (blend 0.75/0.25)** | **11.77** (67% within ±10) |
 
 ## Ideas not tried yet
 
