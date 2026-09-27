@@ -31,16 +31,27 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import glob
+
 import lightgbm as lgb
+import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 
 warnings.filterwarnings("ignore")
+plt.rcParams["figure.figsize"] = (10, 4)
 
-DATA_DIR = os.environ.get("DATA_DIR", "/kaggle/input/predicting-housing-affordability-in-the-u-s")
+# Finds train.csv wherever Kaggle mounted the competition data
+DATA_DIR = os.environ.get("DATA_DIR") or os.path.dirname(
+    (glob.glob("/kaggle/input/**/train.csv", recursive=True) or ["./train.csv"])[0])
+print("data folder:", DATA_DIR)
 T = "AffordabilityPercentageTrue"
+
+# QUICK = True  -> fast check (~1 min): LightGBM only, 1 seed, faster learning rate
+# QUICK = False -> full run for the real submission (~20-30 min on Kaggle CPU)
+QUICK = False
 N_FOLDS = 5
-SEEDS = [0, 1, 2]           # more seeds = steadier predictions (costs run time)
-USE_CATBOOST = True
+SEEDS = [0] if QUICK else [0, 1, 2]
+USE_CATBOOST = not QUICK
 try:
     from catboost import CatBoostRegressor
 except ImportError:
@@ -84,6 +95,43 @@ shift_cols = ["AvgNumberofAdults", "AvgHouseholdSize", "YoungAdultinHouseholdPer
 t7 = test[test.is_seen].set_index("Zip")[shift_cols]
 print("\nJuly minus June feature shift (same ZIPs), in std units:")
 print(((t7 - jun.loc[t7.index, shift_cols]).mean() / jun[shift_cols].std()).round(2))
+
+# %% [markdown]
+# ### 2b. EDA graphs
+# **What to look for:** (1) the target covers 0–100 with a spike at 0; (2) states differ
+# hugely, which is why location features win; (3) May vs June sit on the diagonal, so
+# seen ZIPs are easy; (4) rent-vs-income only loosely predicts the target.
+
+# %%
+fig, ax = plt.subplots(2, 2, figsize=(14, 9))
+train[train.m == 6][T].hist(bins=50, ax=ax[0, 0], color="#4C72B0")
+ax[0, 0].set_title("Target distribution (June)")
+ax[0, 0].set_xlabel("% households that can afford housing")
+
+top = train[train.m == 6].State.value_counts().index[:15]
+order = train[(train.m == 6) & train.State.isin(top)].groupby("State")[T].median().sort_values().index
+data = [train[(train.m == 6) & (train.State == s)][T].values for s in order]
+ax[0, 1].boxplot(data)
+ax[0, 1].set_xticklabels(list(order))
+ax[0, 1].set_title("Target by state (15 biggest)")
+
+ax[1, 0].scatter(may[T], jun[T], s=3, alpha=0.3)
+ax[1, 0].plot([0, 100], [0, 100], "r--", lw=1)
+ax[1, 0].set_xlabel("May"); ax[1, 0].set_ylabel("June")
+ax[1, 0].set_title(f"Same ZIP, May vs June (corr {may[T].corr(jun[T]):.3f})")
+
+j6 = train[train.m == 6]
+lir = np.log(j6.AnnualMedianHouseholdIncome / (40 * j6.RentIndex))
+ax[1, 1].scatter(lir, j6[T], s=3, alpha=0.3)
+ax[1, 1].set_xlabel("log(income / (40 × rent))  (>0 = rent looks affordable)")
+ax[1, 1].set_ylabel("target")
+ax[1, 1].set_title(f"Rent vs income (corr {lir.corr(j6[T]):.2f})")
+plt.tight_layout(); plt.show()
+
+# July feature shift for the same ZIPs
+shift = ((t7 - jun.loc[t7.index, shift_cols]).mean() / jun[shift_cols].std())
+shift.plot.barh(title="July − June feature change, same ZIPs (in std units)", figsize=(8, 3))
+plt.show()
 
 # %% [markdown]
 # ## 3. Seen ZIPs: June value + state drift
@@ -255,6 +303,8 @@ def rows_for(zs, months=(5, 6, 7)):
 LGB_PARAMS = dict(n_estimators=6000, learning_rate=0.02, num_leaves=31, min_child_samples=40,
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.3, reg_lambda=5,
                   verbose=-1)
+if QUICK:
+    LGB_PARAMS["learning_rate"] = 0.06
 CAT_PARAMS = dict(iterations=6000, learning_rate=0.04, depth=6, l2_leaf_reg=5,
                   loss_function="RMSE", verbose=0)
 
@@ -313,6 +363,8 @@ for a, b in KFold(N_FOLDS, shuffle=True, random_state=100).split(zips):
         m, it = fit_model(k, 0, XA, A.y, XB, B.y)
         oof[k].loc[B.Zip.values] = predict(m, XB)
         best_iters[k].append(it)
+        if k == "lgb":
+            last_lgb = m  # kept for the feature-importance chart
     print("fold done:", {k: round(rmse(y_jun.loc[zb], oof[k].loc[zb]), 3) for k in KINDS})
 
 for k in KINDS:
@@ -358,6 +410,33 @@ print(ea.groupby(pd.qcut(ea.SampleSize, 5))["err"].agg(_rmse).round(2))
 print("\nLargest states:")
 print(ea.groupby("State")["err"].agg(n="size", bias="mean", rmse=_rmse)
       .sort_values("n", ascending=False).head(10).round(1))
+
+# %% [markdown]
+# ### 7c. Error graphs
+# **What to look for:** points should hug the red line; the bars show where we miss most.
+# Feature importance tells you which ideas are pulling their weight.
+
+# %%
+fig, ax = plt.subplots(2, 2, figsize=(14, 9))
+ax[0, 0].scatter(ea.y, ea.p, s=3, alpha=0.3)
+ax[0, 0].plot([0, 100], [0, 100], "r--", lw=1)
+ax[0, 0].set_xlabel("true"); ax[0, 0].set_ylabel("predicted")
+ax[0, 0].set_title(f"New-ZIP validation: predicted vs true (RMSE {rmse(ea.y, ea.p):.2f})")
+
+ea.err.hist(bins=60, ax=ax[0, 1], color="#DD8452")
+ax[0, 1].set_title("Error distribution (predicted − true)")
+
+ea.groupby(pd.cut(ea.y, [-1, 0, 10, 30, 50, 70, 90, 100]), observed=True)["err"].mean() \
+    .plot.bar(ax=ax[1, 0], color="#55A868", rot=0)
+ax[1, 0].set_title("Average error by true value (+ = too high)")
+
+ea.groupby(pd.qcut(ea.SampleSize, 5))["err"].agg(_rmse).plot.bar(ax=ax[1, 1], color="#C44E52", rot=20)
+ax[1, 1].set_title("RMSE by household sample size")
+plt.tight_layout(); plt.show()
+
+imp = pd.Series(last_lgb.booster_.feature_importance("gain"), last_lgb.booster_.feature_name())
+(imp / imp.sum()).sort_values().tail(20).plot.barh(figsize=(8, 7), title="Top 20 features (LightGBM gain)")
+plt.tight_layout(); plt.show()
 
 # %% [markdown]
 # ## 8. Train on all seen ZIPs and predict the new ZIPs
