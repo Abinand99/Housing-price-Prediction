@@ -287,8 +287,9 @@ def inner_target_feats(fit_z, rows):
     return pd.concat(parts).loc[rows.index]
 
 
-def rows_for(zs, months=(5, 6, 7)):
-    """May rows get May labels; June and July rows get the June label."""
+def rows_for(zs, months=(6, 7)):
+    """June and July rows get the June label (May rows, if asked for, get May labels).
+    Dropping May from training scored better in CV (11.65 -> 11.63 with extra_trees)."""
     d = al[al.Zip.isin(set(zs)) & al.m.isin(months)].copy()
     d["y"] = np.where(d.m == 5, d.Zip.map(y_may), d.Zip.map(y_jun))
     return d
@@ -302,7 +303,7 @@ def rows_for(zs, months=(5, 6, 7)):
 # %%
 LGB_PARAMS = dict(n_estimators=6000, learning_rate=0.02, num_leaves=31, min_child_samples=40,
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.3, reg_lambda=5,
-                  verbose=-1)
+                  extra_trees=True, verbose=-1)  # extra_trees: CV 11.72 -> 11.65
 if QUICK:
     LGB_PARAMS["learning_rate"] = 0.06
 CAT_PARAMS = dict(iterations=6000, learning_rate=0.04, depth=6, l2_leaf_reg=5,
