@@ -49,7 +49,7 @@ IDEAS = {
 }
 
 
-def quick_cv(extra_cols=(), extra_tf=None, splits=(100, 107)):
+def quick_cv(extra_cols=(), extra_tf=None, splits=(100, 107), seed=0):
     global target_feats
     target_feats = (lambda fz, r: pd.concat([_base_target_feats(fz, r), extra_tf(fz, r)], axis=1)) \
         if extra_tf else _base_target_feats
@@ -62,7 +62,7 @@ def quick_cv(extra_cols=(), extra_tf=None, splits=(100, 107)):
             A, B = rows_for(za), rows_for(zb, (7,))
             XA = pd.concat([A[feats], inner_target_feats(za, A)], axis=1)
             XB = pd.concat([B[feats], target_feats(za, B)], axis=1)
-            m = lgb.LGBMRegressor(**dict(QUICK_PARAMS, random_state=0))
+            m = lgb.LGBMRegressor(**dict(QUICK_PARAMS, random_state=seed))
             m.fit(XA, A.y, eval_set=[(XB, B.y)], callbacks=[lgb.early_stopping(200, verbose=False)])
             o.loc[B.Zip.values] = m.predict(XB)
         scores.append(rmse(y_jun.loc[zips], o))
