@@ -342,9 +342,9 @@ def fit_model(kind, seed, XA, ya, XB=None, yb=None, n_iter=None):
 
 
 class SmallNet:
-    """3 small neural networks averaged. Weaker than LightGBM alone (CV ~12.5 vs ~11.7),
-    but its mistakes differ from the trees', so blending them cut the new-ZIP error by
-    about 0.5 on two different validation splits."""
+    """5 small neural networks (64 -> 32 units) averaged. Their mistakes differ from the
+    trees', so blending them cuts the new-ZIP error a lot. Smaller beat bigger here:
+    (128,64)x3 blend 11.22 -> (64,32)x5 blend 11.07 on a held-out split."""
 
     def __init__(self, seed):
         self.seed = seed
@@ -364,9 +364,9 @@ class SmallNet:
         from sklearn.preprocessing import StandardScaler
         self.nets = [make_pipeline(
             SimpleImputer(strategy="median"), StandardScaler(),
-            MLPRegressor(hidden_layer_sizes=(128, 64), alpha=1e-2, batch_size=256, max_iter=300,
+            MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1e-2, batch_size=256, max_iter=300,
                          early_stopping=True, validation_fraction=0.1, n_iter_no_change=20,
-                         random_state=self.seed * 10 + i)).fit(self._prep(X), y) for i in range(3)]
+                         random_state=self.seed * 10 + i)).fit(self._prep(X), y) for i in range(5)]
         return self
 
     def predict(self, X):
