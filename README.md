@@ -47,7 +47,9 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | + zip4 average + look-alike neighbours (blend) | 11.85 |
 | + extra_trees, train on June+July rows only (blend 0.75/0.25) | 11.77 |
 | Extra features (family, humps, rank in state), averaged over 3 seeds | no gain (within ±0.02 seed noise) |
-| **+ small neural network (blend LightGBM 0.5 / CatBoost 0.15 / NN 0.35)** | **11.34** (MAE 8.4, R² 0.84, 69% within ±10) |
+| + small neural network (128,64)×3 (blend LGB 0.5 / Cat 0.15 / NN 0.35) | 11.34 — public LB 9.500 |
+| NN variants tested: bigger, stronger reg, quantile inputs, kNN | no better |
+| **Smaller networks (64,32)×5 (blend LGB 0.4 / Cat 0.1 / NN 0.5)** | **11.15** (MAE 8.25, R² 0.85, 69% within ±10) |
 
 ## Leaderboard findings (public, 30% of test)
 
