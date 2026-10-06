@@ -45,7 +45,21 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | LightGBM alone / CatBoost alone | 11.95 / 12.02 |
 | LightGBM + CatBoost blend (0.6 / 0.4) | 11.87 |
 | + zip4 average + look-alike neighbours (blend) | 11.85 |
-| **+ extra_trees, train on June+July rows only (blend 0.75/0.25)** | **11.77** (67% within ±10) |
+| + extra_trees, train on June+July rows only (blend 0.75/0.25) | 11.77 |
+| Extra features (family, humps, rank in state), averaged over 3 seeds | no gain (within ±0.02 seed noise) |
+| **+ small neural network (blend LightGBM 0.5 / CatBoost 0.15 / NN 0.35)** | **11.34** (MAE 8.4, R² 0.84, 69% within ±10) |
+
+## Leaderboard findings (public, 30% of test)
+
+| Seen-ZIP strategy (same new-ZIP predictions) | Public score |
+|---|---|
+| June value + state drift | **9.900** |
+| June + change implied by July features | 10.416 |
+| 50% June + 50% model | 10.803 |
+| Model only | 11.949 |
+
+Moving away from the June value only hurts, so seen ZIPs keep the June copy. The scores fit
+roughly `0.2 × seen error + 0.8 × new error`, with the new-ZIP error ≈ 12, which matches validation.
 
 ## Ideas not tried yet
 
