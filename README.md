@@ -90,6 +90,9 @@ roughly `0.2 × seen error + 0.8 × new error`, with the new-ZIP error ≈ 12, w
 - Bigger networks, stronger regularization, quantile-scaled inputs, nearest neighbours: no better.
 - Any seen-ZIP strategy other than the June value: worse on the leaderboard.
 - Large automated hyperparameter searches: expected gains are about the size of the ±0.02 seed noise.
+- Round-2 network designs (pre-registered, fixed 20% weight, needed > 0.05 on two splits):
+  embedding + batch-norm combined gained only −0.04/−0.04; finer location codes (zip4, City)
+  overfit (alone 14.3) and made the blend worse (+0.18/+0.14). Stopped here; v6 is final.
 
 ## Ideas not tried yet
 
