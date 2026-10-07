@@ -50,7 +50,7 @@ T = "AffordabilityPercentageTrue"
 # QUICK = False -> full run for the real submission (~20-30 min on Kaggle CPU)
 QUICK = False
 N_FOLDS = 5
-SEEDS = [0] if QUICK else [0, 1, 2]
+SEEDS = [0] if QUICK else [0, 1, 2, 3, 4]
 USE_CATBOOST = not QUICK
 try:
     from catboost import CatBoostRegressor
@@ -342,9 +342,11 @@ def fit_model(kind, seed, XA, ya, XB=None, yb=None, n_iter=None):
 
 
 class SmallNet:
-    """5 small neural networks (64 -> 32 units) averaged. Their mistakes differ from the
-    trees', so blending them cuts the new-ZIP error a lot. Smaller beat bigger here:
-    (128,64)x3 blend 11.22 -> (64,32)x5 blend 11.07 on a held-out split."""
+    """Small neural networks of three shapes, 3 of each, all averaged. Their mistakes
+    differ from the trees', so blending cuts the new-ZIP error a lot. Smaller beat bigger
+    ((128,64) blend 11.22 -> (64,32) 11.07), and mixing three shapes helped again (-> ~10.9)
+    on a held-out split."""
+    SHAPES = [(64, 32), (32, 16), (64,)]
 
     def __init__(self, seed):
         self.seed = seed
@@ -362,11 +364,13 @@ class SmallNet:
         from sklearn.neural_network import MLPRegressor
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
+        X = self._prep(X)
         self.nets = [make_pipeline(
             SimpleImputer(strategy="median"), StandardScaler(),
-            MLPRegressor(hidden_layer_sizes=(64, 32), alpha=1e-2, batch_size=256, max_iter=300,
+            MLPRegressor(hidden_layer_sizes=shape, alpha=1e-2, batch_size=256, max_iter=300,
                          early_stopping=True, validation_fraction=0.1, n_iter_no_change=20,
-                         random_state=self.seed * 10 + i)).fit(self._prep(X), y) for i in range(5)]
+                         random_state=self.seed * 10 + i)).fit(X, y)
+            for shape in self.SHAPES for i in range(3)]
         return self
 
     def predict(self, X):
