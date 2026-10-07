@@ -49,7 +49,8 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | Extra features (family, humps, rank in state), averaged over 3 seeds | no gain (within ±0.02 seed noise) |
 | + small neural network (128,64)×3 (blend LGB 0.5 / Cat 0.15 / NN 0.35) | 11.34 — public LB 9.500 |
 | NN variants tested: bigger, stronger reg, quantile inputs, kNN | no better |
-| **Smaller networks (64,32)×5 (blend LGB 0.4 / Cat 0.1 / NN 0.5)** | **11.15** (MAE 8.25, R² 0.85, 69% within ±10) |
+| Smaller networks (64,32)×5 (blend LGB 0.4 / Cat 0.1 / NN 0.5) | 11.15 — public LB 9.366 |
+| **Three network shapes averaged + 5 final seeds (blend LGB 0.3 / NN 0.7)** | **11.04** (MAE 8.17, R² 0.85, 69% within ±10) |
 
 ## Leaderboard findings (public, 30% of test)
 
@@ -62,6 +63,26 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 
 Moving away from the June value only hurts, so seen ZIPs keep the June copy. The scores fit
 roughly `0.2 × seen error + 0.8 × new error`, with the new-ZIP error ≈ 12, which matches validation.
+
+## Final approach (v5)
+
+1. **Seen ZIPs (80% of the test):** June value + the state's average May→June drift.
+   The leaderboard tests showed that any move away from the June value scores worse.
+2. **New ZIPs (20%):** blend of 30% LightGBM and 70% small neural networks.
+   - LightGBM uses `extra_trees` and trains on June + July rows (July features with June labels).
+   - The networks are three shapes, (64,32), (32,16) and (64), with 3 of each, all averaged.
+3. **Features:** rent vs income, household mix, each ZIP compared with its area, and neighbour
+   labels (state, metro, zip3, zip4 and city averages, the closest ZIP numbers, and look-alike
+   neighbours in the same zip3). Neighbour labels are always built without the ZIP's own label.
+4. **Validation:** 5-fold over ZIPs, scoring hidden ZIPs on their July rows. Leaderboard moves
+   matched validation every time: 11.77→9.900, 11.34→9.500, 11.15→9.366.
+
+## Tested and rejected (to avoid overfitting)
+
+- Extra engineered features (family, humps, rank in state, per-state rent curve): gains within seed noise.
+- Bigger networks, stronger regularization, quantile-scaled inputs, nearest neighbours: no better.
+- Any seen-ZIP strategy other than the June value: worse on the leaderboard.
+- Large automated hyperparameter searches: expected gains are about the size of the ±0.02 seed noise.
 
 ## Ideas not tried yet
 
