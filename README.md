@@ -50,7 +50,9 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 | + small neural network (128,64)×3 (blend LGB 0.5 / Cat 0.15 / NN 0.35) | 11.34 — public LB 9.500 |
 | NN variants tested: bigger, stronger reg, quantile inputs, kNN | no better |
 | Smaller networks (64,32)×5 (blend LGB 0.4 / Cat 0.1 / NN 0.5) | 11.15 — public LB 9.366 |
-| **Three network shapes averaged + 5 final seeds (blend LGB 0.3 / NN 0.7)** | **11.04** (MAE 8.17, R² 0.85, 69% within ±10) |
+| Three network shapes averaged + 5 final seeds (blend LGB 0.3 / NN 0.7) | 11.04 |
+| Extra model styles (SVR, Ridge) | no gain (≤ 0.01) |
+| **+ PyTorch embedding net + batch-norm net (blend LGB 0.1 / MLP 0.25 / emb 0.3 / bn 0.35)** | **10.71** (MAE 7.90, R² 0.86, 71% within ±10) |
 
 ## Leaderboard findings (public, 30% of test)
 
@@ -64,13 +66,18 @@ The competition data is **not** in this repo: the rules forbid redistributing it
 Moving away from the June value only hurts, so seen ZIPs keep the June copy. The scores fit
 roughly `0.2 × seen error + 0.8 × new error`, with the new-ZIP error ≈ 12, which matches validation.
 
-## Final approach (v5)
+## Final approach (v6)
 
 1. **Seen ZIPs (80% of the test):** June value + the state's average May→June drift.
    The leaderboard tests showed that any move away from the June value scores worse.
-2. **New ZIPs (20%):** blend of 30% LightGBM and 70% small neural networks.
-   - LightGBM uses `extra_trees` and trains on June + July rows (July features with June labels).
-   - The networks are three shapes, (64,32), (32,16) and (64), with 3 of each, all averaged.
+2. **New ZIPs (20%):** blend of four models.
+   - LightGBM (10%): `extra_trees`, trained on June + July rows (July features with June labels).
+   - Small sklearn networks (25%): shapes (64,32), (32,16) and (64), 3 of each, averaged.
+   - PyTorch embedding network (30%): learns a code for each State, Metro and zip3.
+   - PyTorch batch-norm + dropout network (35%).
+   - Both PyTorch designs passed a pre-registered test: 2 designs fixed in advance, a fixed 25%
+     weight, and a gain of more than 0.05 required on two splits (embedding −0.16/−0.20,
+     batch-norm −0.10/−0.13). CatBoost was dropped after it got 0% blend weight.
 3. **Features:** rent vs income, household mix, each ZIP compared with its area, and neighbour
    labels (state, metro, zip3, zip4 and city averages, the closest ZIP numbers, and look-alike
    neighbours in the same zip3). Neighbour labels are always built without the ZIP's own label.
