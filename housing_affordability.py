@@ -51,7 +51,7 @@ T = "AffordabilityPercentageTrue"
 QUICK = False
 N_FOLDS = 5
 SEEDS = [0] if QUICK else [0, 1, 2, 3, 4]
-USE_CATBOOST = not QUICK
+USE_CATBOOST = False  # got 0% blend weight once the networks were added; True to re-enable
 try:
     from catboost import CatBoostRegressor
 except ImportError:
@@ -321,6 +321,9 @@ def to_cat(X):
 def fit_model(kind, seed, XA, ya, XB=None, yb=None, n_iter=None):
     if kind == "mlp":  # uses its own internal early stopping; never sees the validation fold
         return SmallNet(seed).fit(XA, ya), 0
+    if kind in ("emb", "bn"):
+        torch.set_num_threads(os.cpu_count() or 4)
+        return TorchModel(kind, seed).fit(XA, ya), 0
     if kind == "lgb":
         p = dict(LGB_PARAMS, random_state=seed)
         if n_iter:
@@ -377,13 +380,103 @@ class SmallNet:
         return np.clip(np.mean([n.predict(self._prep(X)) for n in self.nets], 0), 0, 100)
 
 
+import torch
+import torch.nn as nn
+
+EMB_COLS = ["State", "Metro", "zip3"]
+
+
+class TorchNet(nn.Module):
+    """design='emb': learns a small code ("embedding") for each State, Metro and zip3.
+    design='bn': batch-norm + dropout layers. Both 64 -> 32 units."""
+
+    def __init__(self, n_num, cards, design):
+        super().__init__()
+        self.embs = nn.ModuleList([nn.Embedding(c + 1, min(8, (c + 1) // 2 + 1)) for c in cards]) \
+            if design == "emb" else nn.ModuleList()
+        d = n_num + sum(e.embedding_dim for e in self.embs)
+        if design == "emb":
+            self.body = nn.Sequential(nn.Linear(d, 64), nn.ReLU(), nn.Dropout(0.1),
+                                      nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 1))
+        else:
+            self.body = nn.Sequential(nn.Linear(d, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.2),
+                                      nn.Linear(64, 32), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.2),
+                                      nn.Linear(32, 1))
+
+    def forward(self, xn, xc):
+        return self.body(torch.cat([xn] + [e(xc[:, i]) for i, e in enumerate(self.embs)], 1)).squeeze(1)
+
+
+class TorchModel:
+    """3 TorchNets averaged. Each stops early on its own 10% hold-out, never the CV fold.
+    Pre-registered test (fixed 25% weight, two splits): embedding net -0.16 / -0.20,
+    batch-norm net -0.10 / -0.13 on the new-ZIP RMSE."""
+
+    def __init__(self, design, seed):
+        self.design, self.seed = design, seed
+
+    def _arrays(self, X, fit=False):
+        num = [c for c in X.columns if c != "State"]
+        if fit:
+            from sklearn.impute import SimpleImputer
+            from sklearn.preprocessing import StandardScaler
+            self.num, self.imp, self.sc = num, SimpleImputer(strategy="median"), StandardScaler()
+            self.sc.fit(self.imp.fit_transform(X[num]))
+            self.vocab = [{v: i + 1 for i, v in enumerate(sorted(al.loc[X.index, c].astype(str).unique()))}
+                          for c in EMB_COLS]  # 0 = never seen in training
+        xn = self.sc.transform(self.imp.transform(X[self.num])).astype("float32")
+        xc = np.stack([al.loc[X.index, c].astype(str).map(v).fillna(0).astype(int).values
+                       for c, v in zip(EMB_COLS, self.vocab)], 1)
+        return torch.tensor(xn), torch.tensor(xc, dtype=torch.long)
+
+    def fit(self, X, y):
+        xn, xc = self._arrays(X, fit=True)
+        yt = torch.tensor(np.asarray(y, dtype="float32"))
+        cards = [len(v) for v in self.vocab]
+        self.nets = []
+        for i in range(3):
+            torch.manual_seed(self.seed * 10 + i)
+            rng = np.random.default_rng(self.seed * 10 + i)
+            idx = rng.permutation(len(yt))
+            vi, ti = idx[: len(idx) // 10], idx[len(idx) // 10:]
+            m = TorchNet(xn.shape[1], cards, self.design)
+            opt = torch.optim.AdamW(m.parameters(), lr=2e-3, weight_decay=1e-4)
+            best, bad = (1e9, None), 0
+            for _ in range(300):
+                m.train()
+                perm = torch.tensor(rng.permutation(ti))
+                for k in range(0, len(perm), 256):
+                    b = perm[k:k + 256]
+                    opt.zero_grad()
+                    ((m(xn[b], xc[b]) - yt[b]) ** 2).mean().backward()
+                    opt.step()
+                m.eval()
+                with torch.no_grad():
+                    vl = ((m(xn[vi], xc[vi]) - yt[vi]) ** 2).mean().item()
+                if vl < best[0] - 1e-3:
+                    best, bad = (vl, {k: v.clone() for k, v in m.state_dict().items()}), 0
+                else:
+                    bad += 1
+                    if bad >= 20:
+                        break
+            m.load_state_dict(best[1])
+            m.eval()
+            self.nets.append(m)
+        return self
+
+    def predict(self, X):
+        xn, xc = self._arrays(X)
+        with torch.no_grad():
+            return np.clip(np.mean([m(xn, xc).numpy() for m in self.nets], 0), 0, 100)
+
+
 def predict(m, X):
     if USE_CATBOOST and isinstance(m, CatBoostRegressor):
         return m.predict(to_cat(X))
     return m.predict(X)
 
 
-KINDS = ["lgb"] + (["cat"] if USE_CATBOOST else []) + ["mlp"]
+KINDS = ["lgb"] + (["cat"] if USE_CATBOOST else []) + ["mlp", "emb", "bn"]
 
 # %% [markdown]
 # ## 7. Cross-validation that copies the "new ZIP" test
